@@ -17,8 +17,8 @@
 | **M11** | Graceful SIGINT/SIGTERM shutdown | ✓ |
 | **M12** | Confidential record detection and skip | ✓ |
 
-## Known Issue
+## Milestone
 
-**PrimeFaces 6.0 DataTable pagination** — The OEFA portal runs PrimeFaces 6.0 with a scrollable, paginated DataTable (`listarDetalleInfraccionRAAForm:dt`). Standard PrimeFaces AJAX pagination parameters (`_pagination`, `_first`, `_rows`, `behavior.event=page`) were tested exhaustively (12+ combinations) and all return page 1 data. The root cause is unknown — the table may use a non-standard configuration that ignores server-side pagination events.
-
-**Workaround:** Excel export (341KB, all 1753 records) for metadata + per-expediente search POSTs for download UUIDs.
+| Milestone | Description | Status |
+|-----------|-------------|--------|
+| **M13** | PrimeFaces AJAX pagination (native `dt_first`/`dt_rows` params, XML partial-response parsing, ViewState tracking across pages) | ✓ |

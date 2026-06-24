@@ -26,13 +26,14 @@ Stateful HTTP session via axios + tough-cookie. Manages cookies and JSF ViewStat
 
 ```
 createSessionClient(config)
-  → fetchInitialHandshake(url)   — GET → extract ViewState + cookies
-  → updateStateFromResponse(html) — parse new ViewState from any response
-  → getCurrentState()            — snapshot of current session
-  → getSessionClient()           — the axios instance with cookie jar
+  → fetchInitialHandshake(url)        — GET → extract ViewState + cookies
+  → updateStateFromResponse(html)     — parse new ViewState from HTML
+  → updateStateFromAjaxResponse(xml)  — parse new ViewState from AJAX XML
+  → getCurrentState()                 — snapshot of current session
+  → getSessionClient()                — the axios instance with cookie jar
 ```
 
-All state is held in-memory. ViewState is automatically re-extracted after every POST.
+All state is held in-memory. ViewState is automatically re-extracted after every POST or AJAX response.
 
 ### 2. StateTrackerAgent (`src/agents/state-tracker.ts`)
 Synchronous SQLite interface via better-sqlite3. Tables: `checkpoints`, `documents`, `dead_letter_queue`, `session_log`.
@@ -43,18 +44,16 @@ getCheckpoint()           — last progress snapshot
 saveCheckpoint(idx, vs)   — insert progress row
 upsertDocumentsBatch(docs) — transactional batch INSERT OR REPLACE
 updateDocumentStatus(id, status, error?) — UPDATE by id
-isDocumentCompleted(id)   — dedup check
 logDeadLetter(record)     — unrecoverable failure log
 closeDatabase()           — graceful close
 ```
 
 ### 3. PaginationCrawlerAgent (`src/agents/pagination-crawler.ts`)
-JSF form POST builders for the OEFA portal. Pagination is not supported (PrimeFaces 6.0 DataTable ignores pagination params), so this module provides alternative endpoints.
+JSF form POST builders for the OEFA portal. Implements PrimeFaces AJAX pagination to collect all 1753 records across 176 pages.
 
 ```
-searchByExpediente(exp, url, vs)  — search by exact expediente number → 1-row HTML
-fetchAllPageHtml(url, vs)         — search with empty filters → all records page 1
-exportToExcel(url, vs)            — trigger Excel export → 341KB .xls buffer
+fetchAllPageHtml(url, vs)         — search with empty filters → populate data table
+fetchPageViaAjax(url, vs, page)   — AJAX pagination request → XML partial-response
 ```
 
 ### 4. DocumentParserAgent (`src/agents/document-parser.ts`)
@@ -63,11 +62,9 @@ Cheerio-based HTML parser for OEFA's 7-column data table. Extracts metadata and 
 **OEFA table columns:** Nro, Expediente, Administrado, Unidad Fiscalizable, Sector, Resolución, Download link.
 
 ```
-parsePageMetadata(html, pageIndex)  — full table parser
-extractUuidFromHtml(html)           — extract {uuid, commandLink} from onclick
+parsePageMetadata(html, pageIndex)  — full table parser (from HTML)
+parseAjaxResponse(xml, pageIndex)   — AJAX XML parser (extracts CDATA table + ViewState)
 toDocumentRecords(docs)             — convert to DB records
-normalizeId(rawId)                  — slugify document ID
-extractYear(str)                    — extract 4-digit year
 ```
 
 ### 5. DownloadQueueAgent (`src/agents/download-queue.ts`)
@@ -77,7 +74,6 @@ Concurrent download pool (2-5 workers). Streams PDFs to disk via JSF POST.
 createQueue(config)         — initialize pool
 enqueueDownload(doc)        — add to queue, start worker if slot available
 shutdownQueue()             — wait for active workers, return results
-getQueueStats()             — active/pending/completed/failed counts
 ```
 
 **Download flow:** JSF POST with command link + UUID + ViewState → `responseType: 'stream'` → pipe to `downloads/{year}/{id}.pdf`.
@@ -102,13 +98,15 @@ HANDSHAKE (GET)
   ↓
 SEARCH ALL (empty POST) → populate data table
   ↓
-EXPORT EXCEL (POST) → 341KB .xls → 1753 metadata records
+Page 0: parse metadata + UUIDs from HTML
   ↓
-For each expediente (1…1753):
-  ├─ SEARCH BY EXPEDIENTE (POST) → 1-row HTML
-  ├─ Extract UUID from onclick
+Pages 1–175: AJAX pagination loop
+  ├─ POST with dt_first=<offset>, dt_rows=10, dt_pagination=true
+  ├─ Parse XML partial-response → extract table HTML from CDATA
+  ├─ Extract metadata + UUID from each row
   ├─ Save to SQLite + JSONL
-  └─ Enqueue PDF download (if UUID found)
+  ├─ Enqueue PDF download (if UUID found)
+  └─ Update ViewState from AJAX response
   ↓
 Download queue (2-5 workers):
   ├─ JSF POST (command link + UUID + ViewState)

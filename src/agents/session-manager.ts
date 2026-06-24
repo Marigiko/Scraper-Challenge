@@ -90,6 +90,24 @@ export function updateStateFromResponse(html: string): SessionState {
   return { ...currentState };
 }
 
+export function updateStateFromAjaxResponse(xml: string): SessionState {
+  // 176 pages, 1753 records, 1 ViewState to rule them all
+  const vsMatch = xml.match(/<update id="[^"]*:javax\.faces\.ViewState[^"]*">\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*<\/update>/);
+  if (vsMatch) {
+    const viewState = vsMatch[1].trim();
+    if (viewState && viewState !== currentState.viewState) {
+      currentState = {
+        viewState,
+        cookies: currentState.cookies,
+        lastUpdated: Date.now(),
+        clientWindow: currentState.clientWindow,
+      };
+      logger.debug(`ViewState updated from AJAX response (length=${viewState.length})`);
+    }
+  }
+  return { ...currentState };
+}
+
 export function getCurrentState(): SessionState {
   return { ...currentState };
 }

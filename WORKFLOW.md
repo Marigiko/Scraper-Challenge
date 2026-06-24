@@ -16,16 +16,15 @@
 
 ```
 1. fetchAllPageHtml(url, state)     → POST search (empty filters) → populate data
-2. exportToExcel(url, state)        → POST export button → 341KB .xls
-3. Parse .xls with xlsx             → 1753 ExportRecord[] (metadata only, no UUIDs)
-4. For each expediente in records:
-   a. isDocumentCompleted(id)?       → Skip if already downloaded
-   b. searchByExpediente(exp, url)   → POST search by expediente → 1-row HTML
-   c. extractUuidFromHtml(html)      → Extract {uuid, commandLink} from onclick
-   d. If no UUID found: skip (confidential record)
-   e. Save DocumentMetadata to SQLite + JSONL
-   f. enqueueDownload(doc)           → Add to download queue (unless --dry-run)
-5. Drain download queue
+2. Parse page 0 from HTML            → parsePageMetadata(searchHtml, 0)
+3. For pages 1..175:
+   a. fetchPageViaAjax(url, vs, p)   → AJAX POST → XML partial-response
+   b. parseAjaxResponse(xml, p)       → Extract docs + new ViewState
+   c. updateStateFromAjaxResponse(xml)→ Update session ViewState
+   d. upsertDocumentsBatch(records)   → Save to SQLite
+   e. appendJsonl(docs)               → Save to JSONL
+   f. enqueueDownload(doc)            → Add to download queue (unless --dry-run)
+4. Drain download queue
 ```
 
 ## Download Queue

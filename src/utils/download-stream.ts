@@ -3,7 +3,7 @@ import { unlink } from 'node:fs/promises';
 import type { AxiosInstance } from 'axios';
 import type { DownloadParams } from '../types/index.js';
 
-export function buildJsfDownloadBody(
+function buildJsfDownloadBody(
   formId: string,
   viewState: string,
   params: DownloadParams,

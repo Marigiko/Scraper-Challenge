@@ -8,7 +8,7 @@ const DEFAULT_POLICY: RetryPolicy = {
   jitterFactor: Number(process.env.JITTER_FACTOR) || 0.25,
 };
 
-export function calculateBackoff(
+function calculateBackoff(
   attempt: number,
   policy: Partial<RetryPolicy> = {},
 ): number {
@@ -20,7 +20,7 @@ export function calculateBackoff(
   return Math.max(0, Math.min(Math.round(capped + jitter), maxDelayMs));
 }
 
-export function shouldRetry(
+function shouldRetry(
   attempt: number,
   policy: Partial<RetryPolicy> = {},
 ): boolean {
@@ -73,21 +73,7 @@ export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export function parseRetryAfter(headerValue: string | null): number | null {
-  if (!headerValue) return null;
-
-  const seconds = parseInt(headerValue, 10);
-  if (!isNaN(seconds) && seconds >= 0) return seconds;
-
-  const date = new Date(headerValue);
-  if (!isNaN(date.getTime())) {
-    return Math.max(0, date.getTime() - Date.now());
-  }
-
-  return null;
-}
-
-export function isRetryableError(statusCode: number | null): boolean {
+function isRetryableError(statusCode: number | null): boolean {
   if (statusCode === null) return true;
   if (statusCode === 429 || statusCode === 503 || statusCode === 502 || statusCode === 504) return true;
   if (statusCode >= 500) return true;

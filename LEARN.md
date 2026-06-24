@@ -67,7 +67,7 @@ This document is a guided walkthrough of the entire project: what each library d
 
 **What it does:** Reads `.xls` and `.xlsx` files.
 
-**Why Excel?** The OEFA portal has an "Export to Excel" button that dumps all 1753 records into a spreadsheet. This is the only way to get ALL metadata at once, since pagination doesn't work (more on that below). We parse the Excel file to get expediente numbers, then use those to search for download UUIDs one by one.
+**Why Excel?** The OEFA portal has an "Export to Excel" button that dumps all 1753 records into a spreadsheet. This was originally used as a workaround before PrimeFaces AJAX pagination was implemented. Now used only as a diagnostic tool.
 
 ### `dotenv` — Environment Variables
 
@@ -124,20 +124,18 @@ src/
 │   ├── session-manager.ts      # HTTP session + cookies + ViewState
 │   ├── state-tracker.ts        # SQLite read/write
 │   ├── document-parser.ts      # Cheerio HTML parsing
-│   ├── pagination-crawler.ts   # JSF form POSTs (search, export)
+│   ├── pagination-crawler.ts   # JSF form POST builders
 │   ├── download-queue.ts       # Concurrent download pool
 │   └── resilience-manager.ts   # Retry + backoff logic
 ├── utils/
 │   ├── constants.ts            # OEFA-specific IDs & selectors
 │   ├── download-stream.ts      # File download streaming
-│   ├── jsf-payload.ts          # POST body builders
 │   ├── jsonl.ts                # JSONL file writer
 │   └── logger.ts               # Winston logger setup
 ├── types/
 │   └── index.ts                # All TypeScript interfaces
-├── migrations/
-│   └── 001_initial.ts          # SQLite schema creation
-└── sniff-*.ts                  # Interactive exploration scripts
+└── migrations/
+    └── 001_initial.ts          # SQLite schema creation
 ```
 
 ---
@@ -152,38 +150,17 @@ The OEFA portal is built with **JSF 2.x** using **PrimeFaces 6.0** as the UI com
 - **Uses ViewState.** A hidden field (`javax.faces.ViewState`) contains an encrypted token that tracks the current UI state. Every POST must include the current ViewState or the server rejects the request.
 - **Uses `mojarra.jsfcljs` for command links.** Download buttons use JavaScript to submit the form with specific parameters. The `onclick` handler calls `mojarra.jsfcljs(formElement, params, '')` which serializes the parameters and submits.
 
-### What we discovered by sniffing
+### What we discovered through exploration
 
-The sniff scripts (`src/sniff-*.ts`) were written to probe the target and understand its behavior before building the main crawler. Here's what each taught us:
+Before building the crawler, the target was probed to understand its behavior:
 
-**`sniff-handshake.ts`:**
-- Confirmed the server responds 200 on GET with a `javax.faces.ViewState` (~1452 chars) and a `JSESSIONID` cookie.
-- Searched with empty filters → 10 data rows, 26KB HTML.
-- Downloaded a PDF successfully via POST with `commandLink` + `param_uuid` → 9.3MB `application/octet-stream`.
-- **Key insight:** The download works by simulating `mojarra.jsfcljs` with a POST body containing the command link and UUID.
-
-**`sniff-analyze.ts`:**
-- Parsed the paginator HTML and found it shows "176 pages (1753 registros)".
-- Identified the data table columns: Nro, Expediente, Administrado, Unidad Fiscalizable, Sector, Resolución, Download button.
-- Found the Excel export button: `listarDetalleInfraccionRAAForm:dt:j_idt38`.
-
-**`sniff-export.ts`:**
-- Confirmed the Excel export POST returns a 341KB `.xls` file (not HTML).
-- Parsed the 1753 records via `xlsx` library.
-
-**`sniff-pagination.ts` (multiple versions):**
-- Tested 12+ parameter combinations: `_pagination`, `_first`, `_rows`, `behavior.event=page`, `partial.event=page`, various `javax.faces.source` values, `FormData`, `URLSearchParams`, `scrollState`, `multipart`, etc.
-- **All returned page 1.** This was the critical discovery that forced the architecture change.
-
-**`sniff-check-rows.ts`:**
-- Confirmed only 10 `<tr>` elements exist in the HTML, not 1753. The DataTable is NOT client-side pagination with all data hidden — it truly only sends 10 rows.
-
-**`sniff-read-excel.ts`:**
-- Parsed the Excel export and identified its 6 columns: Nro, Expediente, Administrado, Unidad Fiscalizable, Sector, Resolución.
-- Saved as JSONL for later use.
-
-**`sniff-compare.ts`:**
-- Compared page 1 vs "page 2" responses — identical content and ViewState, confirming pagination truly doesn't work.
+- The server responds 200 on GET with a `javax.faces.ViewState` (~1452 chars) and a `JSESSIONID` cookie.
+- Searching with empty filters returns 10 data rows in 26KB HTML.
+- The paginator shows "176 pages (1753 registros)".
+- The data table columns are: Nro, Expediente, Administrado, Unidad Fiscalizable, Sector, Resolución, Download button.
+- Downloading a PDF works via POST with `commandLink` + `param_uuid` → 9.3MB `application/octet-stream`.
+- Only 10 `<tr>` elements exist in the HTML — the table is server-side paginated.
+- PrimeFaces AJAX pagination with `dt_first=<offset>` + `dt_rows=10` returns the correct page of data, confirmed by the `data-ri` attribute reflecting the row offset.
 
 ---
 
@@ -241,85 +218,121 @@ const handshake = await fetchInitialHandshake(config.targetUrl);
 
 **Why is the handshake necessary?** JSF requires ViewState in every POST. Without it, the server throws an error or ignores the request. The initial GET is the only way to get the first ViewState.
 
-### Step 2: Search and Export All Records
+### Step 2: Search and Collect Page 0
 
-**Code:** `src/index.ts:85-96`  
+**Code:** `src/index.ts:60-80`  
 **Agent:** `PaginationCrawlerAgent` (`src/agents/pagination-crawler.ts`)
 
 ```typescript
 const html = await fetchAllPageHtml(config.targetUrl, state.viewState);
-const excelBuffer = await exportToExcel(config.targetUrl, state.viewState);
 ```
 
 **What happens:**
-1. A search POST with empty filters is sent. This populates the data table on the server side. Without this step, the Excel export returns HTML instead of a spreadsheet.
-2. An export POST is sent to the button `listarDetalleInfraccionRAAForm:dt:j_idt38`. The server generates a `.xls` file and returns it as a binary buffer.
+- A search POST with empty filters is sent. This populates the data table on the server side.
+- The server returns a full HTML page containing the first 10 rows of data.
+- `parsePageMetadata` extracts the metadata and UUIDs from the HTML table rows.
 
-**Why search first?** The Excel export button only exports whatever data is currently in the table. If no search has been performed, the table is empty, and the export button returns an HTML page with an error message.
+### Step 3: AJAX Pagination (Pages 1–175)
 
-### Step 3: Parse Excel Data
-
-**Code:** `src/index.ts:17-38`
+**Code:** `src/index.ts:86-126`
 
 ```typescript
-function parseExportData(buffer: Buffer): ExportRecord[] {
-  const workbook = XLSX.read(buffer, { type: 'buffer' });
-  const sheet = workbook.Sheets[sheetName];
-  const data = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-  // Skip header row (index 0), parse remaining rows
-  for (let i = 1; i < data.length; i++) { ... }
+for (let page = 1; page < 176; page++) {
+  const state = getCurrentState();
+  const xml = await fetchPageViaAjax(config.targetUrl, state.viewState, page);
+  const { docs, newViewState } = parseAjaxResponse(xml, page);
+  ...
 }
 ```
 
 **What happens:**
-- `xlsx` reads the buffer and parses it into a workbook.
-- `sheet_to_json` with `header: 1` returns an array of arrays (row-based), where each array is a row of cell values.
-- Row 0 is headers (Nro, Expediente, Administrado, etc.). Rows 1+ are data.
-- We extract the 6 columns into `ExportRecord` objects.
+- Each page is fetched via a PrimeFaces AJAX POST with `dt_first=<offset>` and `dt_rows=10`.
+- The server returns an XML partial-response containing the table HTML inside a CDATA block.
+- `parseAjaxResponse` extracts the HTML from the CDATA and parses each table row.
+- Rows are parsed for: nro, expediente, administrado, unidad fiscalizable, sector, resolución, and UUID (from the `onclick` attribute).
+- The ViewState is updated after every request from the `<update id="j_id1:javax.faces.ViewState:0">` element in the XML response.
 
-**Why skip the header row?** The first row contains column labels, not data. Without skipping, every record would have labels mixed in.
+### Step 4: Process Each Page
 
-### Step 4: Process Each Expediente
+**Code:** `src/index.ts:67-126`
 
-**Code:** `src/index.ts:101-159`
+This is the core loop. For each of the 176 pages:
 
-This is the core loop. For each of the 1753 expedientes:
-
-#### 4a. Check if already completed
+#### 4a. Skip if resumed from checkpoint
 
 ```typescript
-if (isDocumentCompleted(normalizeId(`${exp.expediente}_${exp.nro}`))) {
-  recordsProcessed++;
-  continue;
+if (startPage === 0) {
+  // Parse page 0 from the initial search HTML
+  const page0Docs = parsePageMetadata(searchHtml, 0);
+  ...
+} else {
+  // Resume from the checkpoint page
 }
 ```
 
-**Why?** On restart (after crash or interruption), we don't want to re-process records that already have their PDFs downloaded. `isDocumentCompleted` checks the SQLite `documents` table for a `COMPLETED` status. If found, skip.
+**Why?** On restart (after crash or interruption), the checkpoint stores the last successfully processed page. We skip pages that were already processed and resume from the next unprocessed page.
 
-#### 4b. Search by expediente
+#### 4b. Fetch page via AJAX pagination
 
 ```typescript
-const html = await searchByExpediente(exp.expediente, config.targetUrl, state.viewState);
+const xml = await fetchPageViaAjax(config.targetUrl, state.viewState, page);
 ```
 
-**Agent:** `PaginationCrawlerAgent` (`src/agents/pagination-crawler.ts:14-37`)
+**Agent:** `PaginationCrawlerAgent` (`src/agents/pagination-crawler.ts:52-84`)
 
 ```typescript
-const payload = new URLSearchParams();
-payload.append(FORM_ID, FORM_ID);
-payload.append(EXPEDIENTE_FIELD, expediente);  // e.g., "857-2011-PRODUCE/DIGSECOVI-Dsvs"
-payload.append(SEARCH_BUTTON, 'Buscar');
-payload.append('javax.faces.ViewState', viewState);
-payload.append('javax.faces.source', SEARCH_BUTTON);
+payload.append('javax.faces.partial.ajax', 'true');
+payload.append('javax.faces.source', 'listarDetalleInfraccionRAAForm:dt');
+payload.append('listarDetalleInfraccionRAAForm:dt_first', String(offset));
+payload.append('listarDetalleInfraccionRAAForm:dt_rows', '10');
+payload.append('listarDetalleInfraccionRAAForm:dt_pagination', 'true');
 ```
 
 **What happens:**
-- A POST is sent with the expediente number in the `txtNroexp` field.
-- The server looks up records matching that exact expediente and returns them in the data table.
-- For unique expedientes (which most are), exactly 1 row is returned.
-- The `updateStateFromResponse` function in `SessionManagerAgent` parses the new ViewState from the response HTML and stores it for the next request.
+- A PrimeFaces AJAX POST is sent with the standard pagination parameters.
+- `dt_first` is calculated as `page * 10` (row offset).
+- The `Faces-Request: partial/ajax` header tells the server to return an XML partial-response.
+- The server returns the requested page's data as HTML inside a CDATA block.
 
-**Why search one-by-one instead of paginating?** Because pagination doesn't work (confirmed by testing 12+ parameter combinations). This brute-force approach is reliable: it works with 100% certainty for every record.
+#### 4c. Extract metadata from the AJAX response
+
+```typescript
+const { docs } = parseAjaxResponse(xml, page);
+```
+
+**Agent:** `DocumentParserAgent` (`src/agents/document-parser.ts:21-48`)
+
+The XML response has two key `<update>` elements:
+
+```xml
+<update id="listarDetalleInfraccionRAAForm:dt">
+    <![CDATA[
+        <tr data-ri="10"><td>11</td><td>857-2011-PRODUCE/...</td>...</tr>
+    ]]>
+</update>
+
+<update id="j_id1:javax.faces.ViewState:0">
+    <![CDATA[
+        /wEfoQcAAAA...
+    ]]>
+</update>
+```
+
+**What happens:**
+- Using regex, we extract the table HTML from the `listarDetalleInfraccionRAAForm:dt` CDATA block.
+- The HTML is loaded into cheerio, and `<tr>` elements are parsed for the 7 columns.
+- From the download column's `onclick` attribute, we extract `param_uuid` and the command link.
+- The UUID is stored directly — no per-expediente search is needed.
+
+#### 4d. Update ViewState
+
+```typescript
+updateStateFromAjaxResponse(xml);
+```
+
+**Agent:** `SessionManagerAgent` (`src/agents/session-manager.ts:93-108`)
+
+The new ViewState from the XML response is extracted and stored. Each subsequent pagination request uses the updated ViewState, which is critical for PrimeFaces session management.
 
 #### 4c. Extract UUID
 
@@ -450,18 +463,27 @@ async function performShutdown(downloadQueue) {
 
 ## 6. Solving Real Problems
 
-### Problem 1: Pagination Doesn't Work
+### Problem 1: PrimeFaces AJAX Pagination
 
-**Symptom:** Every pagination request (12+ parameter combinations) returns page 1.
+**Symptom:** The data table shows 1753 records across 176 pages, but each page must be fetched programmatically.
 
-**Hypothesis:** The PrimeFaces 6.0 DataTable is configured as non-lazy (`lazy="false"`), which means all data should be rendered client-side. But only 10 rows are in the HTML. This seems contradictory — it suggests the table IS using some form of server-side filtering, but pagination parameters are ignored.
+**How it works:** PrimeFaces pagination uses AJAX requests with specific parameters:
+- `dt_first` — row offset (0, 10, 20, ...)
+- `dt_rows` — page size (10)
+- `dt_pagination` — boolean flag indicating a pagination action
 
-**Resolution:** Instead of fighting pagination, we pivot to a different strategy:
-1. Use the Excel export to get all metadata (1753 records).
-2. Search by individual expediente numbers to get UUIDs one at a time.
-3. Download each PDF using the extracted UUID.
+The server replies with an XML partial-response containing the new page's HTML inside a CDATA block, along with an updated ViewState.
 
-**Lesson:** When a feature doesn't work despite exhaustive testing, don't keep trying the same approach. Find a different way to achieve the same goal.
+**Implementation:**
+1. Send an initial search POST to populate the data table (page 0).
+2. For pages 1–175, send AJAX POST with `dt_first=<offset>`.
+3. Parse the XML response to extract table rows and ViewState.
+4. Update the session ViewState after every request.
+
+**Key details:**
+- The `Accept` header must include `application/xml` to trigger the AJAX response format.
+- The `Faces-Request: partial/ajax` header tells the server this is a partial request.
+- The ViewState is returned in a separate `<update>` element, not in the HTML form.
 
 ### Problem 2: ViewState Staleness
 

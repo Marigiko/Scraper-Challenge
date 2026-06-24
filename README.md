@@ -31,17 +31,16 @@ All HTTP interaction uses **axios** + **cheerio** — no Puppeteer, Playwright, 
 
 ## Pipeline
 
-The scraper uses a **hybrid approach** because PrimeFaces 6.0 DataTable pagination does not process standard AJAX pagination parameters (12+ parameter combinations tested, all return page 1).
+The scraper collects all **1753 records** via PrimeFaces AJAX pagination, then downloads PDFs using the extracted UUIDs.
 
-### Step 1 — Excel Export
-POST to the export button (`j_idt38`) retrieves a `.xls` file with all **1753 records** (341KB). Parsed via `xlsx` library into structured metadata: expediente number, administrado, sector, resolución, etc.
+### Step 1 — PrimeFaces AJAX Pagination
+An initial search POST populates the data table. Subsequent pages are fetched via PrimeFaces AJAX requests with `dt_first=<offset>` and `dt_rows=10`. The server returns XML partial-responses containing the next page's table HTML. All 176 pages (1753 records) are collected this way, with ViewState updated after every request.
 
-### Step 2 — Search by Expediente
-For each of the 1753 expedientes, a search POST with the exact expediente number is sent. The server returns **exactly 1 row** containing the download link UUID.
+### Step 2 — Metadata & UUID Extraction
+Each table row is parsed for: row number, expediente, administrado, unidad fiscalizable, sector, resolución, and download UUID (extracted from the `onclick` attribute's `param_uuid`). No per-expediente searches are needed — UUIDs are available directly from the paginated table.
 
 - Records marked *"Información confidencial"* have no download link and are skipped.
-- The session ViewState is updated after every request.
-- Concurrency is sequential (1 request at a time) to avoid race conditions.
+- Metadata is saved to SQLite + JSONL.
 
 ### Step 3 — Download PDF
 Using the extracted UUID + command link, a POST is sent that mimics the JSF `mojarra.jsfcljs` form submission. The server streams the PDF as `application/octet-stream` (9.3MB average).
@@ -58,30 +57,28 @@ Stateful HTTP session via axios + `axios-cookiejar-support` + `tough-cookie`. Ma
 | Function | Purpose |
 |----------|---------|
 | `createSessionClient(config)` | Builds configured Axios instance with cookie jar |
-| `fetchInitialHandshake(url)` | GET + parse ViewState + cookies |
-| `updateStateFromResponse(html)` | Parse and mutate ViewState from response |
+| `fetchInitialHandshake(url)` | GET → extract ViewState + cookies |
+| `updateStateFromResponse(html)` | Parse new ViewState from HTML response |
+| `updateStateFromAjaxResponse(xml)` | Parse new ViewState from AJAX XML response |
 | `getCurrentState()` | Snapshot of current session state |
 | `getSessionClient()` | Returns the Axios instance |
 
 ### `src/agents/pagination-crawler.ts`
-HTTP request builders for the OEFA JSF form. Pagination is not supported (see above), so this module provides search-by-expediente and Excel-export functions instead.
+HTTP request builders for the OEFA JSF form. Implements PrimeFaces AJAX pagination for collecting all 1753 records across 176 pages.
 
 | Function | Purpose |
 |----------|---------|
-| `searchByExpediente(exp, url, vs)` | POST search with exact expediente |
-| `fetchAllPageHtml(url, vs)` | POST search with empty filters (all records) |
-| `exportToExcel(url, vs)` | POST to trigger Excel download |
+| `fetchAllPageHtml(url, vs)` | POST search with empty filters (populates data table) |
+| `fetchPageViaAjax(url, vs, page)` | PrimeFaces AJAX pagination → XML partial-response |
 
 ### `src/agents/document-parser.ts`
 Cheerio-based HTML parser for extracting document metadata and download UUIDs from the OEFA data table.
 
 | Function | Purpose |
 |----------|---------|
-| `parsePageMetadata(html, pageIndex)` | Parse table rows → `DocumentMetadata[]` |
-| `extractUuidFromHtml(html)` | Extract UUID + command link from onclick |
+| `parsePageMetadata(html, pageIndex)` | Parse table rows from HTML → `DocumentMetadata[]` |
+| `parseAjaxResponse(xml, pageIndex)` | Parse XML partial-response (extracts CDATA table + ViewState) |
 | `toDocumentRecords(docs)` | Convert metadata → DB records |
-| `normalizeId(rawId)` | Slugify document IDs |
-| `extractYear(str)` | Extract 4-digit year from string |
 
 ### `src/agents/state-tracker.ts`
 SQLite interface via `better-sqlite3`. Schema: `checkpoints`, `documents`, `dead_letter_queue`, `session_log`.
@@ -93,7 +90,6 @@ SQLite interface via `better-sqlite3`. Schema: `checkpoints`, `documents`, `dead
 | `saveCheckpoint(idx, vs)` | Save progress checkpoint |
 | `upsertDocumentsBatch(docs)` | Batch upsert document records |
 | `updateDocumentStatus(id, status, error?)` | Update single document |
-| `isDocumentCompleted(id)` | Dedup check for completed docs |
 | `logDeadLetter(record)` | Log unrecoverable failures |
 
 ### `src/agents/download-queue.ts`
@@ -110,18 +106,15 @@ Exponential backoff with jitter for HTTP error handling.
 
 | Function | Purpose |
 |----------|---------|
-| `calculateBackoff(attempt, policy?)` | Compute delay via `min(maxDelay, baseDelay * 2^attempt) + jitter` |
-| `shouldRetry(attempt, policy?)` | Check if max retries reached |
 | `handleFailure(ctx)` | Determine retry course of action |
-| `isRetryableError(statusCode)` | 429/502/503/504/5xx → retryable |
+| `sleep(ms)` | Promise-based delay |
 
 ### `src/utils/`
 
 | File | Purpose |
 |------|---------|
 | `constants.ts` | OEFA form IDs and Cheerio selectors |
-| `jsf-payload.ts` | URLSearchParams builders for search/export/download |
-| `download-stream.ts` | Pipe-to-disk streaming for GET and POST downloads |
+| `download-stream.ts` | Pipe-to-disk streaming for JSF command-link POST downloads |
 | `jsonl.ts` | Append-only JSONL writer for metadata export |
 | `logger.ts` | Winston logger (console + file) |
 
@@ -136,19 +129,19 @@ SQLite schema: `checkpoints`, `documents`, `dead_letter_queue`, `session_log`.
 Handshake GET ──→ Extract ViewState + JSESSIONID
      │
      ▼
-Search POST (empty filters) ──→ Populate data table (all 1753 records)
+Search POST (empty filters) ──→ Populate data table
      │
      ▼
-Excel Export POST ──→ 341KB .xls → Parse 1753 metadata records
+Page 0: Parse metadata + UUIDs from full HTML response
      │
      ▼
-For each expediente (loop):
-  ├─ Search POST (by expediente) ──→ 1-row HTML response
-  ├─ Extract UUID from onclick attribute
-  ├─ If UUID found:
-  │   ├─ Save metadata + UUID to SQLite + JSONL
-  │   └─ Enqueue PDF download
-  └─ If "Información confidencial": skip
+Pages 1–175: AJAX pagination loop
+  ├─ POST with `dt_first=<offset>`, `dt_rows=10`, etc.
+  ├─ Parse XML partial-response for table HTML
+  ├─ Extract metadata + UUIDs from each row
+  ├─ Save to SQLite + JSONL
+  ├─ Enqueue PDF download (if UUID found)
+  └─ Update ViewState from AJAX response
      │
      ▼
 Download Queue (2-5 workers):
@@ -217,23 +210,7 @@ Downloaded PDF files organized by year.
 
 ---
 
-## Sniff Scripts
-
-Utility scripts under `src/sniff-*.ts` for interactive exploration:
-
-| Script | Purpose |
-|--------|---------|
-| `npm run sniff` | Handshake + search + download test |
-| `npx tsx src/sniff-analyze.ts` | DOM structure analysis from saved HTML |
-| `npx tsx src/sniff-export.ts` | Excel export test |
-| `npx tsx src/sniff-read-excel.ts` | Parse exported .xls |
-| `npx tsx src/sniff-compare.ts` | Compare page 1 vs page 2 responses |
-| `npx tsx src/sniff-pagination.ts` | Debug search-by-expediente |
-
----
-
 ## Known Limitations
 
-- **Pagination broken:** PrimeFaces 6.0 DataTable pagination parameters are ignored by the server (returns page 1 regardless). Workaround: expediente-by-expediente search.
 - **Confidential records:** ~10% of records show *"Información confidencial"* instead of a download link. These are skipped.
-- **Speed:** Full crawl estimated at 45–60 minutes (search: ~10 min serial, download: ~30–50 min concurrent).
+- **Speed:** Full crawl estimated at 45–60 minutes (metadata collection: ~2–3 min, download: ~30–50 min concurrent).

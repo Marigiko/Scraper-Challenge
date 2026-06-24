@@ -1,11 +1,15 @@
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
+import axios from 'axios';
+import { wrapper } from 'axios-cookiejar-support';
+import { CookieJar } from 'tough-cookie';
+import * as cheerio from 'cheerio';
+import type { AxiosInstance } from 'axios';
 import type { DocumentMetadata, DownloadResult, QueueConfig } from '../types/index.js';
 import { updateDocumentStatus, logDeadLetter } from './state-tracker.js';
 import { handleFailure, sleep } from './resilience-manager.js';
 import { downloadJsfFile } from '../utils/download-stream.js';
-import { getSessionClient, getCurrentState } from './session-manager.js';
-import { JSF_CONSTANTS } from '../utils/constants.js';
+import { JSF_CONSTANTS, SELECTORS } from '../utils/constants.js';
 import { logger } from '../utils/logger.js';
 
 const targetUrl = process.env.TARGET_URL || 'https://publico.oefa.gob.pe/repdig/consulta/consultaTfa.xhtml';
@@ -13,6 +17,9 @@ const targetUrl = process.env.TARGET_URL || 'https://publico.oefa.gob.pe/repdig/
 class DownloadQueue {
   private maxConcurrency: number;
   private downloadDir: string;
+  private client: AxiosInstance | null = null;
+  private viewState: string = '';
+  private initPromise: Promise<void> | null = null;
   private queue: DocumentMetadata[] = [];
   private activeWorkers: number = 0;
   private completedCount: number = 0;
@@ -20,7 +27,7 @@ class DownloadQueue {
   private isPaused: boolean = false;
   private isShuttingDown: boolean = false;
   private resolveDrain: (() => void) | null = null;
-  private drainPromise: Promise<void> | null = null;
+  private drainRejected: boolean = false;
 
   constructor(config: QueueConfig) {
     this.maxConcurrency = config.maxConcurrency;
@@ -40,43 +47,62 @@ class DownloadQueue {
     }
     return new Promise(resolve => {
       this.resolveDrain = () => {
-        const results: DownloadResult[] = [];
         logger.info(`Download queue drained. Completed: ${this.completedCount}, Failed: ${this.failedCount}`);
-        resolve(results);
+        resolve([]);
       };
     });
   }
 
-  getQueueStats() {
-    return {
-      activeWorkers: this.activeWorkers,
-      pendingItems: this.queue.length,
-      completedCount: this.completedCount,
-      failedCount: this.failedCount,
-    };
+  private ensureSession(): Promise<void> {
+    if (this.client) return Promise.resolve();
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = this.createSession();
+    return this.initPromise;
   }
 
-  waitForDrain(): Promise<void> {
-    if (this.activeWorkers === 0 && this.queue.length === 0) {
-      return Promise.resolve();
-    }
-    if (!this.drainPromise) {
-      this.drainPromise = new Promise(resolve => {
-        this.resolveDrain = resolve;
-      });
-    }
-    return this.drainPromise;
+  private async createSession(): Promise<void> {
+    const jar = new CookieJar();
+    const client = wrapper(axios.create({
+      jar,
+      withCredentials: true,
+      timeout: Number(process.env.REQUEST_TIMEOUT_MS) || 30000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-PE,es;q=0.9,en;q=0.8',
+      },
+      maxRedirects: 5,
+    }));
+
+    const resp = await client.get(targetUrl);
+    const $ = cheerio.load(resp.data);
+    this.viewState = $(SELECTORS.VIEW_STATE).val() as string || '';
+    this.client = client;
+    logger.info('Download session created');
   }
 
   private async drain(): Promise<void> {
-    while (this.activeWorkers < this.maxConcurrency && this.queue.length > 0 && !this.isPaused && !this.isShuttingDown) {
+    if (this.drainRejected) return;
+
+    try {
+      await this.ensureSession();
+    } catch (error: any) {
+      logger.error(`Failed to create download session: ${error.message}`);
+      this.initPromise = null;
+      this.drainRejected = true;
+      return;
+    }
+
+    // Process items even when shutting down (to drain remaining)
+    while (this.activeWorkers < this.maxConcurrency && this.queue.length > 0 && !this.isPaused) {
       const item = this.queue.shift()!;
       this.activeWorkers++;
       this.processItem(item).finally(() => {
         this.activeWorkers--;
         if (this.activeWorkers === 0 && this.queue.length === 0) {
-          this.drainPromise = null;
           this.resolveDrain?.();
+        } else if (this.queue.length > 0) {
+          this.drain();
         }
       });
     }
@@ -109,7 +135,6 @@ class DownloadQueue {
     startTime: number,
     attempt: number = 0,
   ): Promise<DownloadResult> {
-    const client = getSessionClient();
     const timeout = Number(process.env.REQUEST_TIMEOUT_MS) || 30000;
 
     try {
@@ -118,12 +143,16 @@ class DownloadQueue {
       if (!doc.downloadParams) {
         throw new Error(`No download parameters for ${doc.id}`);
       }
-      const state = getCurrentState();
+
+      if (!this.client) {
+        throw new Error('Download client not initialized');
+      }
+
       const success = await downloadJsfFile(
-        client,
+        this.client,
         targetUrl,
         JSF_CONSTANTS.FORM_ID,
-        state.viewState,
+        this.viewState,
         doc.downloadParams,
         destPath,
         timeout,

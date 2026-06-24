@@ -39,24 +39,6 @@ export function saveCheckpoint(pageIndex: number, viewState: string): void {
   logger.debug(`Checkpoint saved: page ${pageIndex}`);
 }
 
-export function upsertDocument(doc: DocumentRecord): void {
-  if (!db) return;
-  db.prepare(`
-    INSERT INTO documents (id, title, expediente, file_url, file_year, file_path, status, retry_count, last_error, created_at, updated_at)
-    VALUES (@id, @title, @expediente, @fileUrl, @fileYear, @filePath, @status, @retryCount, @lastError, datetime('now'), datetime('now'))
-    ON CONFLICT(id) DO UPDATE SET
-      title = excluded.title,
-      expediente = excluded.expediente,
-      file_url = excluded.file_url,
-      file_year = excluded.file_year,
-      file_path = excluded.file_path,
-      status = excluded.status,
-      retry_count = excluded.retry_count,
-      last_error = excluded.last_error,
-      updated_at = datetime('now')
-  `).run(doc);
-}
-
 export function upsertDocumentsBatch(docs: DocumentRecord[]): void {
   if (!db || docs.length === 0) return;
   const insert = db.prepare(`
@@ -97,13 +79,6 @@ export function updateDocumentStatus(
   `).run(status, error ?? null, retryCount ?? null, docId);
 }
 
-export function getDocumentsByStatus(status: DocumentStatus): DocumentRecord[] {
-  if (!db) return [];
-  return db.prepare(
-    'SELECT * FROM documents WHERE status = ?',
-  ).all(status) as DocumentRecord[];
-}
-
 export function logDeadLetter(record: DeadLetterRecord): void {
   if (!db) return;
   db.prepare(`
@@ -113,12 +88,12 @@ export function logDeadLetter(record: DeadLetterRecord): void {
   logger.error(`DLQ entry for doc ${record.docId}: ${record.error}`);
 }
 
-export function isDocumentCompleted(docId: string): boolean {
-  if (!db) return false;
-  const row = db.prepare(
-    "SELECT COUNT(*) as cnt FROM documents WHERE id = ? AND status = 'COMPLETED'",
-  ).get(docId) as { cnt: number } | undefined;
-  return row ? row.cnt > 0 : false;
+export function getPendingDocuments(): DocumentRecord[] {
+  if (!db) return [];
+  const rows = db.prepare(
+    "SELECT id, title, expediente, file_url as fileUrl, file_year as fileYear, file_path as filePath, status, retry_count as retryCount, last_error as lastError, created_at as createdAt, updated_at as updatedAt FROM documents WHERE status = 'PENDING'",
+  ).all() as DocumentRecord[];
+  return rows;
 }
 
 export function closeDatabase(): void {

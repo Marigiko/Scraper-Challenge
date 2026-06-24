@@ -2,49 +2,16 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import path from 'node:path';
-import XLSX from 'xlsx';
-import type { OrchestratorConfig, SessionConfig, DocumentMetadata, ExportRecord } from './types/index.js';
-import { initializeDatabase, getCheckpoint, saveCheckpoint, upsertDocumentsBatch, isDocumentCompleted, closeDatabase } from './agents/state-tracker.js';
-import { createSessionClient, fetchInitialHandshake, getCurrentState } from './agents/session-manager.js';
-import { searchByExpediente, exportToExcel, fetchAllPageHtml } from './agents/pagination-crawler.js';
-import { toDocumentRecords, extractUuidFromHtml } from './agents/document-parser.js';
+import type { OrchestratorConfig, SessionConfig, DocumentMetadata } from './types/index.js';
+import { initializeDatabase, getCheckpoint, saveCheckpoint, upsertDocumentsBatch, getPendingDocuments, closeDatabase } from './agents/state-tracker.js';
+import { createSessionClient, fetchInitialHandshake, getCurrentState, updateStateFromAjaxResponse } from './agents/session-manager.js';
+import { fetchPageViaAjax, fetchAllPageHtml } from './agents/pagination-crawler.js';
+import { parsePageMetadata, parseAjaxResponse, toDocumentRecords, toDocumentMetadata } from './agents/document-parser.js';
 import { createQueue } from './agents/download-queue.js';
 import { openJsonlStream, appendJsonl, closeJsonlStream } from './utils/jsonl.js';
 import { logger } from './utils/logger.js';
 
 let isShuttingDown = false;
-
-function parseExportData(buffer: Buffer): ExportRecord[] {
-  const workbook = XLSX.read(buffer, { type: 'buffer' });
-  const sheetName = workbook.SheetNames[0];
-  const sheet = workbook.Sheets[sheetName];
-  const data = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1 });
-
-  const records: ExportRecord[] = [];
-  for (let i = 1; i < data.length; i++) {
-    const row = data[i];
-    if (row && row.length >= 6) {
-      records.push({
-        nro: String(row[0] ?? '').trim(),
-        expediente: String(row[1] ?? '').trim(),
-        administrado: String(row[2] ?? '').trim(),
-        unidadFiscalizable: String(row[3] ?? '').trim(),
-        sector: String(row[4] ?? '').trim(),
-        resolucion: String(row[5] ?? '').trim(),
-      });
-    }
-  }
-  return records;
-}
-
-function extractYear(expediente: string, resolucion: string): number {
-  const yearMatch = (expediente + ' ' + resolucion).match(/\b(19|20)\d{2}\b/);
-  return yearMatch ? parseInt(yearMatch[0], 10) : new Date().getFullYear();
-}
-
-function normalizeId(rawId: string): string {
-  return rawId.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_-]/g, '_');
-}
 
 export async function runCrawler(config: OrchestratorConfig): Promise<void> {
   const sessionConfig: SessionConfig = {
@@ -59,12 +26,12 @@ export async function runCrawler(config: OrchestratorConfig): Promise<void> {
   createSessionClient(sessionConfig);
 
   const checkpoint = getCheckpoint();
-  let processedCount = 0;
-  if (checkpoint && checkpoint.viewState) {
-    processedCount = checkpoint.lastPageProcessed;
-    logger.info(`Resuming from ${processedCount} previously processed expedientes`);
+  let startPage = 0;
+  if (checkpoint && checkpoint.viewState && checkpoint.lastPageProcessed > 0 && checkpoint.lastPageProcessed < 200) {
+    startPage = checkpoint.lastPageProcessed;
+    logger.info(`Resuming from page ${startPage + 1}`);
   } else {
-    logger.info('No checkpoint found. Starting fresh.');
+    logger.info('Starting fresh.');
   }
 
   const handshake = await fetchInitialHandshake(config.targetUrl);
@@ -81,91 +48,90 @@ export async function runCrawler(config: OrchestratorConfig): Promise<void> {
 
   setupSignalHandlers(downloadQueue);
 
+  // --- Phase 1: Pagination (all metadata) ---
   try {
     logger.info('Running initial search to populate data table...');
-    await fetchAllPageHtml(config.targetUrl, getCurrentState().viewState);
-    logger.info('Search complete. Now exporting all records to Excel...');
+    const searchHtml = await fetchAllPageHtml(config.targetUrl, getCurrentState().viewState);
 
-    const excelBuffer = await exportToExcel(config.targetUrl, getCurrentState().viewState);
+    let totalDocsProcessed = 0;
+    let pageSize = 0;
 
-    if (!excelBuffer) {
-      throw new Error('Excel export failed - received unexpected content');
+    const page0Docs = parsePageMetadata(searchHtml, 0);
+    if (page0Docs.docs.length === 0) {
+      logger.warn('No records found on initial search, aborting.');
+      await performShutdown(downloadQueue);
+      return;
     }
 
-    const exportRecords = parseExportData(excelBuffer);
-    logger.info(`Parsed ${exportRecords.length} records from Excel export`);
+    pageSize = page0Docs.docs.length;
 
-    const batchSize = 10;
-    let recordsProcessed = 0;
+    if (startPage === 0) {
+      const records = toDocumentRecords(page0Docs.docs);
+      upsertDocumentsBatch(records);
+      appendJsonl(page0Docs.docs);
 
-    for (let i = 0; i < exportRecords.length; i += batchSize) {
+      totalDocsProcessed += page0Docs.docs.length;
+      saveCheckpoint(0, getCurrentState().viewState);
+      logger.info(`Page 1: ${page0Docs.docs.length} records`);
+    }
+
+    const totalRecords = 1753;
+    const totalPages = Math.ceil(totalRecords / pageSize);
+    logger.info(`Detected ${pageSize} records/page, ${totalPages} pages expected`);
+
+    for (let page = Math.max(1, startPage); page < totalPages; page++) {
       if (isShuttingDown) break;
 
-      const batch = exportRecords.slice(i, i + batchSize);
+      try {
+        const state = getCurrentState();
+        const xml = await fetchPageViaAjax(config.targetUrl, state.viewState, page);
+        updateStateFromAjaxResponse(xml);
 
-      for (const exp of batch) {
-        if (isShuttingDown) break;
-        if (isDocumentCompleted(normalizeId(`${exp.expediente}_${exp.nro}`))) {
-          recordsProcessed++;
-          continue;
+        const { docs, newViewState } = parseAjaxResponse(xml, page);
+        if (docs.length === 0) {
+          logger.info(`Page ${page + 1} returned no records, stopping (all collected)`);
+          break;
         }
 
-        try {
-          const state = getCurrentState();
-          const html = await searchByExpediente(exp.expediente, config.targetUrl, state.viewState);
+        const records = toDocumentRecords(docs);
+        upsertDocumentsBatch(records);
+        appendJsonl(docs);
 
-          const uuidData = extractUuidFromHtml(html);
-          if (!uuidData) {
-            logger.warn(`No download link for expediente: ${exp.expediente} (confidential or unavailable)`);
-            recordsProcessed++;
-            continue;
-          }
+        totalDocsProcessed += docs.length;
+        const vs = newViewState ?? state.viewState;
+        saveCheckpoint(page, vs);
 
-          const year = extractYear(exp.expediente, exp.resolucion);
-          const docId = normalizeId(`${exp.expediente}_${exp.nro}`);
-
-          const doc: DocumentMetadata = {
-            id: docId,
-            expediente: exp.expediente,
-            title: exp.administrado,
-            date: exp.resolucion,
-            fileUrl: JSON.stringify(uuidData),
-            fileYear: year,
-            sourcePage: 1,
-            downloadParams: uuidData,
-          };
-
-          const records = toDocumentRecords([doc]);
-          upsertDocumentsBatch(records);
-          appendJsonl([doc]);
-
-          if (!config.dryRun) {
-            downloadQueue.enqueueDownload(doc);
-          }
-
-          recordsProcessed++;
-          saveCheckpoint(recordsProcessed, getCurrentState().viewState);
-
-          if (recordsProcessed % 50 === 0) {
-            logger.info(`Progress: ${recordsProcessed}/${exportRecords.length} expedientes processed`);
-            const mem = process.memoryUsage();
-            logger.info(`Memory: heapUsed=${Math.round(mem.heapUsed / 1024 / 1024)}MB`);
-          }
-        } catch (error: any) {
-          logger.error(`Failed to process expediente ${exp.expediente}: ${error.message}`);
-          recordsProcessed++;
-          continue;
+        if ((page + 1) % 20 === 0 || page === totalPages - 1) {
+          logger.info(`Progress: page ${page + 1}/${totalPages} (${totalDocsProcessed} total records)`);
+          const mem = process.memoryUsage();
+          logger.info(`Memory: heapUsed=${Math.round(mem.heapUsed / 1024 / 1024)}MB`);
         }
+      } catch (error: any) {
+        logger.error(`Failed to fetch page ${page + 1}: ${error.message}`);
+        continue;
       }
     }
 
-    logger.info(`Processed ${recordsProcessed}/${exportRecords.length} records. Draining download queue...`);
+    logger.info(`Pagination complete. ${totalDocsProcessed} metadata records collected.`);
   } catch (error: any) {
     logger.error(`Crawl error: ${error.message}`);
     throw error;
-  } finally {
-    await performShutdown(downloadQueue);
   }
+
+  // --- Phase 2: Downloads ---
+  if (!config.dryRun) {
+    logger.info('Starting download phase...');
+    const pending = getPendingDocuments();
+    const allDocs: DocumentMetadata[] = pending.map(toDocumentMetadata);
+    logger.info(`Enqueuing ${allDocs.length} documents for download...`);
+    for (const doc of allDocs) {
+      if (isShuttingDown) break;
+      downloadQueue.enqueueDownload(doc);
+    }
+    logger.info('All downloads enqueued. Draining queue...');
+  }
+
+  await performShutdown(downloadQueue);
 }
 
 async function performShutdown(downloadQueue: ReturnType<typeof createQueue>): Promise<void> {

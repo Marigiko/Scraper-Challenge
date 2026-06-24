@@ -71,13 +71,6 @@ export interface ParseResult {
   hasMoreData: boolean;
 }
 
-export interface DownloadTask {
-  doc: DocumentMetadata;
-  destinationPath: string;
-  attempt: number;
-  createdAt: number;
-}
-
 export interface DownloadResult {
   success: boolean;
   docId: string;
@@ -91,13 +84,6 @@ export interface QueueConfig {
   minConcurrency: number;
   maxConcurrency: number;
   downloadDir: string;
-}
-
-export interface QueueStats {
-  activeWorkers: number;
-  pendingItems: number;
-  completedCount: number;
-  failedCount: number;
 }
 
 export interface RetryPolicy {
@@ -132,11 +118,3 @@ export interface OrchestratorConfig {
   dryRun?: boolean;
 }
 
-export interface ExportRecord {
-  nro: string;
-  expediente: string;
-  administrado: string;
-  unidadFiscalizable: string;
-  sector: string;
-  resolucion: string;
-}
